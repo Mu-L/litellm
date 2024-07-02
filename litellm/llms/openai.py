@@ -1,33 +1,42 @@
+import hashlib
+import json
+import time
+import traceback
+import types
 from typing import (
-    Optional,
-    Union,
     Any,
     BinaryIO,
-    Literal,
+    Callable,
+    Coroutine,
     Iterable,
+    Literal,
+    Optional,
+    Union,
 )
-import hashlib
-from typing_extensions import override, overload
-from pydantic import BaseModel
-import types, time, json, traceback
+
 import httpx
-from .base import BaseLLM
-from litellm.utils import (
-    ModelResponse,
-    Choices,
-    Message,
-    CustomStreamWrapper,
-    convert_to_model_response_object,
-    Usage,
-    TranscriptionResponse,
-    TextCompletionResponse,
-)
-from typing import Callable, Optional, Coroutine
-import litellm
-from .prompt_templates.factory import prompt_factory, custom_prompt
-from openai import OpenAI, AsyncOpenAI
-from ..types.llms.openai import *
 import openai
+from openai import AsyncOpenAI, OpenAI
+from pydantic import BaseModel
+from typing_extensions import overload, override
+
+import litellm
+from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.types.utils import ProviderField
+from litellm.utils import (
+    Choices,
+    CustomStreamWrapper,
+    Message,
+    ModelResponse,
+    TextCompletionResponse,
+    TranscriptionResponse,
+    Usage,
+    convert_to_model_response_object,
+)
+
+from ..types.llms.openai import *
+from .base import BaseLLM
+from .prompt_templates.factory import custom_prompt, prompt_factory
 
 
 class OpenAIError(Exception):
@@ -164,6 +173,68 @@ class MistralConfig:
         return optional_params
 
 
+class MistralEmbeddingConfig:
+    """
+    Reference: https://docs.mistral.ai/api/#operation/createEmbedding
+    """
+
+    def __init__(
+        self,
+    ) -> None:
+        locals_ = locals().copy()
+        for key, value in locals_.items():
+            if key != "self" and value is not None:
+                setattr(self.__class__, key, value)
+
+    @classmethod
+    def get_config(cls):
+        return {
+            k: v
+            for k, v in cls.__dict__.items()
+            if not k.startswith("__")
+            and not isinstance(
+                v,
+                (
+                    types.FunctionType,
+                    types.BuiltinFunctionType,
+                    classmethod,
+                    staticmethod,
+                ),
+            )
+            and v is not None
+        }
+
+    def get_supported_openai_params(self):
+        return [
+            "encoding_format",
+        ]
+
+    def map_openai_params(self, non_default_params: dict, optional_params: dict):
+        for param, value in non_default_params.items():
+            if param == "encoding_format":
+                optional_params["encoding_format"] = value
+        return optional_params
+
+
+class AzureAIStudioConfig:
+    def get_required_params(self) -> List[ProviderField]:
+        """For a given provider, return it's required fields with a description"""
+        return [
+            ProviderField(
+                field_name="api_key",
+                field_type="string",
+                field_description="Your Azure AI Studio API Key.",
+                field_value="zEJ...",
+            ),
+            ProviderField(
+                field_name="api_base",
+                field_type="string",
+                field_description="Your Azure AI Studio API Base.",
+                field_value="https://Mistral-serverless.",
+            ),
+        ]
+
+
 class DeepInfraConfig:
     """
     Reference: https://deepinfra.com/docs/advanced/openai_api
@@ -243,8 +314,12 @@ class DeepInfraConfig:
         ]
 
     def map_openai_params(
-        self, non_default_params: dict, optional_params: dict, model: str
-    ):
+        self,
+        non_default_params: dict,
+        optional_params: dict,
+        model: str,
+        drop_params: bool,
+    ) -> dict:
         supported_openai_params = self.get_supported_openai_params()
         for param, value in non_default_params.items():
             if (
@@ -253,8 +328,23 @@ class DeepInfraConfig:
                 and model == "mistralai/Mistral-7B-Instruct-v0.1"
             ):  # this model does no support temperature == 0
                 value = 0.0001  # close to 0
+            if param == "tool_choice":
+                if (
+                    value != "auto" and value != "none"
+                ):  # https://deepinfra.com/docs/advanced/function_calling
+                    ## UNSUPPORTED TOOL CHOICE VALUE
+                    if litellm.drop_params is True or drop_params is True:
+                        value = None
+                    else:
+                        raise litellm.utils.UnsupportedParamsError(
+                            message="Deepinfra doesn't support tool_choice={}. To drop unsupported openai params from the call, set `litellm.drop_params = True`".format(
+                                value
+                            ),
+                            status_code=400,
+                        )
             if param in supported_openai_params:
-                optional_params[param] = value
+                if value is not None:
+                    optional_params[param] = value
         return optional_params
 
 
@@ -511,7 +601,7 @@ class OpenAIChatCompletion(BaseLLM):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         timeout: Union[float, httpx.Timeout] = httpx.Timeout(None),
-        max_retries: Optional[int] = None,
+        max_retries: Optional[int] = 2,
         organization: Optional[str] = None,
         client: Optional[Union[OpenAI, AsyncOpenAI]] = None,
     ):
@@ -563,6 +653,36 @@ class OpenAIChatCompletion(BaseLLM):
         else:
             return client
 
+    async def make_openai_chat_completion_request(
+        self,
+        openai_aclient: AsyncOpenAI,
+        data: dict,
+        timeout: Union[float, httpx.Timeout],
+    ):
+        """
+        Helper to:
+        - call chat.completions.create.with_raw_response when litellm.return_response_headers is True
+        - call chat.completions.create by default
+        """
+        try:
+            if litellm.return_response_headers is True:
+                raw_response = (
+                    await openai_aclient.chat.completions.with_raw_response.create(
+                        **data, timeout=timeout
+                    )
+                )
+
+                headers = dict(raw_response.headers)
+                response = raw_response.parse()
+                return headers, response
+            else:
+                response = await openai_aclient.chat.completions.create(
+                    **data, timeout=timeout
+                )
+                return None, response
+        except Exception as e:
+            raise e
+
     def completion(
         self,
         model_response: ModelResponse,
@@ -589,17 +709,17 @@ class OpenAIChatCompletion(BaseLLM):
             if headers:
                 optional_params["extra_headers"] = headers
             if model is None or messages is None:
-                raise OpenAIError(status_code=422, message=f"Missing model or messages")
+                raise OpenAIError(status_code=422, message="Missing model or messages")
 
             if not isinstance(timeout, float) and not isinstance(
                 timeout, httpx.Timeout
             ):
                 raise OpenAIError(
                     status_code=422,
-                    message=f"Timeout needs to be a float or httpx.Timeout",
+                    message="Timeout needs to be a float or httpx.Timeout",
                 )
 
-            if custom_llm_provider != "openai":
+            if custom_llm_provider is not None and custom_llm_provider != "openai":
                 model_response.model = f"{custom_llm_provider}/{model}"
                 # process all OpenAI compatible provider logic here
                 if custom_llm_provider == "mistral":
@@ -747,13 +867,13 @@ class OpenAIChatCompletion(BaseLLM):
         self,
         data: dict,
         model_response: ModelResponse,
+        logging_obj: LiteLLMLoggingObj,
         timeout: Union[float, httpx.Timeout],
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         organization: Optional[str] = None,
         client=None,
         max_retries=None,
-        logging_obj=None,
         headers=None,
     ):
         response = None
@@ -780,8 +900,8 @@ class OpenAIChatCompletion(BaseLLM):
                 },
             )
 
-            response = await openai_aclient.chat.completions.create(
-                **data, timeout=timeout
+            headers, response = await self.make_openai_chat_completion_request(
+                openai_aclient=openai_aclient, data=data, timeout=timeout
             )
             stringified_response = response.model_dump()
             logging_obj.post_call(
@@ -790,9 +910,11 @@ class OpenAIChatCompletion(BaseLLM):
                 original_response=stringified_response,
                 additional_args={"complete_input_dict": data},
             )
+            logging_obj.model_call_details["response_headers"] = headers
             return convert_to_model_response_object(
                 response_object=stringified_response,
                 model_response_object=model_response,
+                hidden_params={"headers": headers},
             )
         except Exception as e:
             raise e
@@ -842,10 +964,10 @@ class OpenAIChatCompletion(BaseLLM):
 
     async def async_streaming(
         self,
-        logging_obj,
         timeout: Union[float, httpx.Timeout],
         data: dict,
         model: str,
+        logging_obj: LiteLLMLoggingObj,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         organization: Optional[str] = None,
@@ -876,9 +998,10 @@ class OpenAIChatCompletion(BaseLLM):
                 },
             )
 
-            response = await openai_aclient.chat.completions.create(
-                **data, timeout=timeout
+            headers, response = await self.make_openai_chat_completion_request(
+                openai_aclient=openai_aclient, data=data, timeout=timeout
             )
+            logging_obj.model_call_details["response_headers"] = headers
             streamwrapper = CustomStreamWrapper(
                 completion_stream=response,
                 model=model,
@@ -903,17 +1026,43 @@ class OpenAIChatCompletion(BaseLLM):
                 else:
                     raise OpenAIError(status_code=500, message=f"{str(e)}")
 
+    # Embedding
+    async def make_openai_embedding_request(
+        self,
+        openai_aclient: AsyncOpenAI,
+        data: dict,
+        timeout: Union[float, httpx.Timeout],
+    ):
+        """
+        Helper to:
+        - call embeddings.create.with_raw_response when litellm.return_response_headers is True
+        - call embeddings.create by default
+        """
+        try:
+            if litellm.return_response_headers is True:
+                raw_response = await openai_aclient.embeddings.with_raw_response.create(
+                    **data, timeout=timeout
+                )  # type: ignore
+                headers = dict(raw_response.headers)
+                response = raw_response.parse()
+                return headers, response
+            else:
+                response = await openai_aclient.embeddings.create(**data, timeout=timeout)  # type: ignore
+                return None, response
+        except Exception as e:
+            raise e
+
     async def aembedding(
         self,
         input: list,
         data: dict,
-        model_response: ModelResponse,
+        model_response: litellm.utils.EmbeddingResponse,
         timeout: float,
+        logging_obj: LiteLLMLoggingObj,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
-        client=None,
+        client: Optional[AsyncOpenAI] = None,
         max_retries=None,
-        logging_obj=None,
     ):
         response = None
         try:
@@ -925,7 +1074,10 @@ class OpenAIChatCompletion(BaseLLM):
                 max_retries=max_retries,
                 client=client,
             )
-            response = await openai_aclient.embeddings.create(**data, timeout=timeout)  # type: ignore
+            headers, response = await self.make_openai_embedding_request(
+                openai_aclient=openai_aclient, data=data, timeout=timeout
+            )
+            logging_obj.model_call_details["response_headers"] = headers
             stringified_response = response.model_dump()
             ## LOGGING
             logging_obj.post_call(
@@ -950,9 +1102,9 @@ class OpenAIChatCompletion(BaseLLM):
         input: list,
         timeout: float,
         logging_obj,
+        model_response: litellm.utils.EmbeddingResponse,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
-        model_response: Optional[litellm.utils.EmbeddingResponse] = None,
         optional_params=None,
         client=None,
         aembedding=None,
@@ -973,7 +1125,17 @@ class OpenAIChatCompletion(BaseLLM):
             )
 
             if aembedding is True:
-                response = self.aembedding(data=data, input=input, logging_obj=logging_obj, model_response=model_response, api_base=api_base, api_key=api_key, timeout=timeout, client=client, max_retries=max_retries)  # type: ignore
+                response = self.aembedding(
+                    data=data,
+                    input=input,
+                    logging_obj=logging_obj,
+                    model_response=model_response,
+                    api_base=api_base,
+                    api_key=api_key,
+                    timeout=timeout,
+                    client=client,
+                    max_retries=max_retries,
+                )
                 return response
 
             openai_client = self._get_openai_client(
@@ -1130,6 +1292,34 @@ class OpenAIChatCompletion(BaseLLM):
             else:
                 raise OpenAIError(status_code=500, message=str(e))
 
+    # Audio Transcriptions
+    async def make_openai_audio_transcriptions_request(
+        self,
+        openai_aclient: AsyncOpenAI,
+        data: dict,
+        timeout: Union[float, httpx.Timeout],
+    ):
+        """
+        Helper to:
+        - call openai_aclient.audio.transcriptions.with_raw_response when litellm.return_response_headers is True
+        - call openai_aclient.audio.transcriptions.create by default
+        """
+        try:
+            if litellm.return_response_headers is True:
+                raw_response = (
+                    await openai_aclient.audio.transcriptions.with_raw_response.create(
+                        **data, timeout=timeout
+                    )
+                )  # type: ignore
+                headers = dict(raw_response.headers)
+                response = raw_response.parse()
+                return headers, response
+            else:
+                response = await openai_aclient.audio.transcriptions.create(**data, timeout=timeout)  # type: ignore
+                return None, response
+        except Exception as e:
+            raise e
+
     def audio_transcriptions(
         self,
         model: str,
@@ -1187,11 +1377,11 @@ class OpenAIChatCompletion(BaseLLM):
         data: dict,
         model_response: TranscriptionResponse,
         timeout: float,
+        logging_obj: LiteLLMLoggingObj,
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
         client=None,
         max_retries=None,
-        logging_obj=None,
     ):
         try:
             openai_aclient = self._get_openai_client(
@@ -1203,9 +1393,12 @@ class OpenAIChatCompletion(BaseLLM):
                 client=client,
             )
 
-            response = await openai_aclient.audio.transcriptions.create(
-                **data, timeout=timeout
-            )  # type: ignore
+            headers, response = await self.make_openai_audio_transcriptions_request(
+                openai_aclient=openai_aclient,
+                data=data,
+                timeout=timeout,
+            )
+            logging_obj.model_call_details["response_headers"] = headers
             stringified_response = response.model_dump()
             ## LOGGING
             logging_obj.post_call(
@@ -1398,9 +1591,9 @@ class OpenAITextCompletion(BaseLLM):
         model: str,
         messages: list,
         timeout: float,
+        logging_obj: LiteLLMLoggingObj,
         print_verbose: Optional[Callable] = None,
         api_base: Optional[str] = None,
-        logging_obj=None,
         acompletion: bool = False,
         optional_params=None,
         litellm_params=None,
@@ -1487,6 +1680,7 @@ class OpenAITextCompletion(BaseLLM):
                 response = openai_client.completions.create(**data)  # type: ignore
 
                 response_json = response.model_dump()
+
                 ## LOGGING
                 logging_obj.post_call(
                     input=prompt,
@@ -2088,7 +2282,7 @@ class OpenAIAssistantsAPI(BaseLLM):
     async def a_add_message(
         self,
         thread_id: str,
-        message_data: MessageData,
+        message_data: dict,
         api_key: Optional[str],
         api_base: Optional[str],
         timeout: Union[float, httpx.Timeout],
@@ -2123,7 +2317,7 @@ class OpenAIAssistantsAPI(BaseLLM):
     def add_message(
         self, 
         thread_id: str,
-        message_data: MessageData,
+        message_data: dict,
         api_key: Optional[str],
         api_base: Optional[str],
         timeout: Union[float, httpx.Timeout],
@@ -2138,7 +2332,7 @@ class OpenAIAssistantsAPI(BaseLLM):
     def add_message(
         self, 
         thread_id: str,
-        message_data: MessageData,
+        message_data: dict,
         api_key: Optional[str],
         api_base: Optional[str],
         timeout: Union[float, httpx.Timeout],
@@ -2154,7 +2348,7 @@ class OpenAIAssistantsAPI(BaseLLM):
     def add_message(
         self,
         thread_id: str,
-        message_data: MessageData,
+        message_data: dict,
         api_key: Optional[str],
         api_base: Optional[str],
         timeout: Union[float, httpx.Timeout],
@@ -2534,6 +2728,56 @@ class OpenAIAssistantsAPI(BaseLLM):
 
         return response
 
+    def async_run_thread_stream(
+        self,
+        client: AsyncOpenAI,
+        thread_id: str,
+        assistant_id: str,
+        additional_instructions: Optional[str],
+        instructions: Optional[str],
+        metadata: Optional[object],
+        model: Optional[str],
+        tools: Optional[Iterable[AssistantToolParam]],
+        event_handler: Optional[AssistantEventHandler],
+    ) -> AsyncAssistantStreamManager[AsyncAssistantEventHandler]:
+        data = {
+            "thread_id": thread_id,
+            "assistant_id": assistant_id,
+            "additional_instructions": additional_instructions,
+            "instructions": instructions,
+            "metadata": metadata,
+            "model": model,
+            "tools": tools,
+        }
+        if event_handler is not None:
+            data["event_handler"] = event_handler
+        return client.beta.threads.runs.stream(**data)  # type: ignore
+
+    def run_thread_stream(
+        self,
+        client: OpenAI,
+        thread_id: str,
+        assistant_id: str,
+        additional_instructions: Optional[str],
+        instructions: Optional[str],
+        metadata: Optional[object],
+        model: Optional[str],
+        tools: Optional[Iterable[AssistantToolParam]],
+        event_handler: Optional[AssistantEventHandler],
+    ) -> AssistantStreamManager[AssistantEventHandler]:
+        data = {
+            "thread_id": thread_id,
+            "assistant_id": assistant_id,
+            "additional_instructions": additional_instructions,
+            "instructions": instructions,
+            "metadata": metadata,
+            "model": model,
+            "tools": tools,
+        }
+        if event_handler is not None:
+            data["event_handler"] = event_handler
+        return client.beta.threads.runs.stream(**data)  # type: ignore
+
     # fmt: off
 
     @overload
@@ -2552,8 +2796,9 @@ class OpenAIAssistantsAPI(BaseLLM):
         timeout: Union[float, httpx.Timeout],
         max_retries: Optional[int],
         organization: Optional[str],
-        client: Optional[AsyncOpenAI],
+        client,
         arun_thread: Literal[True], 
+        event_handler: Optional[AssistantEventHandler],
     ) -> Coroutine[None, None, Run]:
         ...
 
@@ -2573,8 +2818,9 @@ class OpenAIAssistantsAPI(BaseLLM):
         timeout: Union[float, httpx.Timeout],
         max_retries: Optional[int],
         organization: Optional[str],
-        client: Optional[OpenAI],
+        client,
         arun_thread: Optional[Literal[False]], 
+        event_handler: Optional[AssistantEventHandler],
     ) -> Run: 
         ...
 
@@ -2597,8 +2843,29 @@ class OpenAIAssistantsAPI(BaseLLM):
         organization: Optional[str],
         client=None,
         arun_thread=None,
+        event_handler: Optional[AssistantEventHandler] = None,
     ):
         if arun_thread is not None and arun_thread == True:
+            if stream is not None and stream == True:
+                _client = self.async_get_openai_client(
+                    api_key=api_key,
+                    api_base=api_base,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                    organization=organization,
+                    client=client,
+                )
+                return self.async_run_thread_stream(
+                    client=_client,
+                    thread_id=thread_id,
+                    assistant_id=assistant_id,
+                    additional_instructions=additional_instructions,
+                    instructions=instructions,
+                    metadata=metadata,
+                    model=model,
+                    tools=tools,
+                    event_handler=event_handler,
+                )
             return self.arun_thread(
                 thread_id=thread_id,
                 assistant_id=assistant_id,
@@ -2623,6 +2890,19 @@ class OpenAIAssistantsAPI(BaseLLM):
             organization=organization,
             client=client,
         )
+
+        if stream is not None and stream == True:
+            return self.run_thread_stream(
+                client=openai_client,
+                thread_id=thread_id,
+                assistant_id=assistant_id,
+                additional_instructions=additional_instructions,
+                instructions=instructions,
+                metadata=metadata,
+                model=model,
+                tools=tools,
+                event_handler=event_handler,
+            )
 
         response = openai_client.beta.threads.runs.create_and_poll(  # type: ignore
             thread_id=thread_id,

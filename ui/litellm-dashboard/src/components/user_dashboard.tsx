@@ -4,6 +4,7 @@ import {
   userInfoCall,
   modelAvailableCall,
   getTotalSpendCall,
+  getProxyBaseUrlAndLogoutUrl,
 } from "./networking";
 import { Grid, Col, Card, Text, Title } from "@tremor/react";
 import CreateKey from "./create_key_button";
@@ -23,6 +24,14 @@ type UserSpendData = {
   max_budget?: number | null;
 };
 
+function getCookie(name: string) {
+  console.log("COOKIES", document.cookie)
+  const cookieValue = document.cookie
+      .split('; ')
+      .find(row => row.startsWith(name + '='));
+  return cookieValue ? cookieValue.split('=')[1] : null;
+}
+
 interface UserDashboardProps {
   userID: string | null;
   userRole: string | null;
@@ -33,6 +42,8 @@ interface UserDashboardProps {
   setUserEmail: React.Dispatch<React.SetStateAction<string | null>>;
   setTeams: React.Dispatch<React.SetStateAction<Object[] | null>>;
   setKeys: React.Dispatch<React.SetStateAction<Object[] | null>>;
+  setProxySettings: React.Dispatch<React.SetStateAction<any>>;
+  proxySettings: any;
 }
 
 type TeamInterface = {
@@ -51,6 +62,8 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   setUserEmail,
   setTeams,
   setKeys,
+  setProxySettings,
+  proxySettings,
 }) => {
   const [userSpendData, setUserSpendData] = useState<UserSpendData | null>(
     null
@@ -61,7 +74,8 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
   const viewSpend = searchParams.get("viewSpend");
   const router = useRouter();
 
-  const token = searchParams.get("token");
+  const token = getCookie('token');
+
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [teamSpend, setTeamSpend] = useState<number | null>(null);
   const [userModels, setUserModels] = useState<string[]>([]);
@@ -99,6 +113,10 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
         return "Admin Viewer";
       case "app_user":
         return "App User";
+      case "internal_user":
+        return "Internal User";
+      case "internal_user_viewer":
+        return "Internal Viewer";
       default:
         return "Unknown Role";
     }
@@ -140,6 +158,9 @@ const UserDashboard: React.FC<UserDashboardProps> = ({
       } else {
         const fetchData = async () => {
           try {
+            const proxy_settings = await getProxyBaseUrlAndLogoutUrl(accessToken);
+            setProxySettings(proxy_settings);
+
             const response = await userInfoCall(
               accessToken,
               userID,
